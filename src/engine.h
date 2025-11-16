@@ -76,6 +76,7 @@ public:
 
   // Run inference and return output tensors.
   rust::Vec<OutputTensor> infer(const rust::Vec<InputTensor> &input);
+  void infer_zerocopy(const rust::Vec<InputTensor> &input, rust::Vec<OutputTensor> &output);
 
   // Get dimensions for all input tensors
   rust::Vec<TensorInfo> get_input_dims() const;
@@ -129,7 +130,9 @@ private:
 
   // Options values.
   const std::string kEnginePath;
-  const uint32_t kDeviceIndex; 
+  const uint32_t kDeviceIndex;
+  void map_address(int i, std::string & name, void * ptr, long len, bool map);
+  void map_io_addresses(std::unordered_map<std::string, const InputTensor*> &inputMap, std::unordered_map<std::string, const OutputTensor*> &outputMap, bool map);
 };
 
 // Rust friends.

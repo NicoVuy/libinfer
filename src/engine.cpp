@@ -74,6 +74,31 @@ template <typename T> static void resize(rust::Vec<T> &v, size_t len) {
   }
 }
 
+char const* kind(cudaPointerAttributes a, bool pma, bool cma) {
+    switch(a.type) {
+    case cudaMemoryTypeHost: return pma?
+      "Unified: CUDA Host or Registered Memory" :
+      "Not Unified: CUDA Host or Registered Memory";
+    case cudaMemoryTypeDevice: return "Not Unified: CUDA Device Memory";
+    case cudaMemoryTypeManaged: return cma?
+      "Unified: CUDA Managed Memory" : "Not Unified: CUDA Managed Memory";
+    case cudaMemoryTypeUnregistered: return pma?
+      "Unified: System-Allocated Memory" :
+      "Not Unified: System-Allocated Memory";
+    default: return "unknown";
+    }
+}
+
+void check_pointer(int i, void* ptr) {
+  cudaPointerAttributes attr;
+  cudaPointerGetAttributes(&attr, ptr);
+  int pma = 0, cma = 0, device = 0;
+  cudaGetDevice(&device);
+  cudaDeviceGetAttribute(&pma, cudaDevAttrPageableMemoryAccess, device);
+  cudaDeviceGetAttribute(&cma, cudaDevAttrConcurrentManagedAccess, device);
+  // printf("Pointer %d %x: memory is %s\n", i, ptr, kind(attr, pma, cma));
+}
+
 Engine::Engine(const Options &options)
     : kEnginePath(options.path), kDeviceIndex(options.device_index) {
   if (!spdlog::get("libinfer")) {
@@ -398,6 +423,169 @@ rust::Vec<OutputTensor> Engine::infer(const rust::Vec<InputTensor> &input) {
   
   return outputs;
 }
+
+void Engine::map_address(int i, std::string & name, void * ptr, long len, bool map){
+    if (map){
+        check_pointer(i, ptr);
+        checkCudaErrorCode(cudaHostRegister(ptr, len, cudaHostRegisterDefault));
+        bool status = mContext->setTensorAddress(name.c_str(), ptr);
+        if (!status) {
+            throw std::runtime_error("Unable to set output tensor address for: " + name);
+        }
+    }else{
+        checkCudaErrorCode(cudaHostUnregister(ptr));
+    }
+}
+
+void Engine::map_io_addresses(std::unordered_map<std::string, const InputTensor*> &inputMap, std::unordered_map<std::string, const OutputTensor*> &outputMap, bool map) {
+    // Set the address of all input and output buffers using cached names
+    for (int i = 0; i < static_cast<int>(mTensorMetadata.size()); ++i) {
+        const auto &metadata = mTensorMetadata[i];
+        // Find the corresponding input data
+        auto it = inputMap.find(metadata.name);
+        if (it == inputMap.end()) {
+            // Find the corresponding output data
+            auto ito = outputMap.find(metadata.name);
+            if (ito == outputMap.end()) {
+                throw std::runtime_error("Missing tensor: " + metadata.name);}
+            else{
+                const auto &tensorOutput = *ito->second;
+                map_address(i, mTensorMetadata[i].name, (void *)tensorOutput.data.data(),tensorOutput.data.size(), map);
+            }
+        }
+        else
+        {
+          const auto &tensorInput = *it->second;
+          map_address(i, mTensorMetadata[i].name, (void *)tensorInput.data.data(),tensorInput.data.size(), map);
+      }
+    }
+}
+
+void Engine::infer_zerocopy(const rust::Vec<InputTensor> &input, rust::Vec<OutputTensor> &output) {
+  // Create a map from tensor name to input data for easy lookup
+  std::unordered_map<std::string, const InputTensor*> inputMap;
+  for (const auto &tensorInput : input) {
+    inputMap[std::string(tensorInput.name)] = &tensorInput;
+  }
+  // Create a map from tensor name to output data for easy lookup
+  std::unordered_map<std::string, const OutputTensor*> outputMap;
+  for (const auto &tensorOutput : output) {
+    outputMap[std::string(tensorOutput.name)] = &tensorOutput;
+  }
+
+  // Track the batch size (should be consistent across all inputs)
+  int32_t batchSize = -1;
+
+  // Process each input tensor using cached metadata
+  for (int i = 0; i < static_cast<int>(mTensorMetadata.size()); ++i) {
+    const auto &metadata = mTensorMetadata[i];
+    if (metadata.ioMode != TensorIOMode::kINPUT) {
+      continue;
+    }
+
+    // Find the corresponding input data
+    auto it = inputMap.find(metadata.name);
+    if (it == inputMap.end()) {
+      throw std::runtime_error("Missing tensor: " + metadata.name);
+    }
+
+    const auto &tensor = *it->second;
+    const auto &dims = metadata.dims;
+
+    // Calculate expected tensor size (excluding batch dimension)
+    size_t tensorSize = 1;
+    for (int d = 1; d < dims.nbDims; ++d) {
+      tensorSize *= dims.d[d];
+    }
+    tensorSize *= metadata.dataTypeSize; // Account for data type size
+
+    // Calculate batch size from first encountered tensor
+    int32_t currentBatchSize = tensor.data.size() / tensorSize;
+
+    if (batchSize == -1) {
+      batchSize = currentBatchSize;
+
+      // Validate batch size constraints
+      if (batchSize < mMinBatchSize) {
+        throw std::runtime_error("Batch size " + std::to_string(batchSize) +
+                               " is less than minimum: " + std::to_string(mMinBatchSize));
+      }
+      if (batchSize > mMaxBatchSize) {
+        throw std::runtime_error("Batch size " + std::to_string(batchSize) +
+                               " is greater than maximum: " + std::to_string(mMaxBatchSize));
+      }
+    } else if (currentBatchSize != batchSize) {
+      throw std::runtime_error("Inconsistent batch sizes across tensors");
+    }
+
+    // Validate tensor size
+    if (tensor.data.size() % tensorSize != 0) {
+      throw std::runtime_error("Tensor '" + metadata.name +
+                              "' does not contain whole number of batches");
+    }
+
+    // Set input shape with batch dimension
+    nvinfer1::Dims inputDims = dims;
+    inputDims.d[0] = batchSize;
+    bool shapeStatus = mContext->setInputShape(metadata.name.c_str(), inputDims);
+    if (!shapeStatus) {
+      throw std::runtime_error("Failed to set input shape for tensor: " + metadata.name);
+    }
+  }
+
+  // Process each input tensor using cached metadata
+  for (int i = 0; i < static_cast<int>(mTensorMetadata.size()); ++i) {
+    const auto &metadata = mTensorMetadata[i];
+    if (metadata.ioMode == TensorIOMode::kINPUT) {
+      continue;
+    }
+
+    // Find the corresponding outpu data
+    auto it = outputMap.find(metadata.name);
+    if (it == outputMap.end()) {
+      throw std::runtime_error("Missing tensor: " + metadata.name);
+    }
+
+    const auto &tensor = *it->second;
+    const auto &dims = metadata.dims;
+
+    // Calculate expected tensor size (excluding batch dimension)
+    size_t tensorSize = 1;
+    for (int d = 1; d < dims.nbDims; ++d) {
+      tensorSize *= dims.d[d];
+    }
+    tensorSize *= metadata.dataTypeSize; // Account for data type size
+    tensorSize *= batchSize;
+    // Validate tensor size
+    if (tensor.data.size() % tensorSize != 0) {
+        throw std::runtime_error("Tensor '" + metadata.name +
+                                "' does not contain whole number of batches, expected " + std::to_string(tensorSize)+" bytes");
+    }
+  }
+
+  checkCudaErrorCode(cudaDeviceSynchronize());
+
+  // Ensure all dynamic bindings have been defined
+  if (!mContext->allInputDimensionsSpecified()) {
+    throw std::runtime_error("Error, not all required dimensions specified.");
+  }
+
+  map_io_addresses(inputMap, outputMap, true);
+  auto cleanup = [&]() { map_io_addresses(inputMap, outputMap, false); };  // Lambda for cleanup
+  std::shared_ptr<void> guard(nullptr, [&](void*) { cleanup(); });  // RAII via shared_ptr deleter
+  checkCudaErrorCode(cudaDeviceSynchronize());
+  // Run inference
+  bool status = mContext->enqueueV3(mInferenceCudaStream);
+  if (!status) {
+    throw std::runtime_error("Inference execution failed");
+  }
+  checkCudaErrorCode(cudaStreamSynchronize(mInferenceCudaStream));
+
+  checkCudaErrorCode(cudaDeviceSynchronize());
+}
+
+
+
 
 size_t Engine::get_num_inputs() const {
   size_t count = 0;

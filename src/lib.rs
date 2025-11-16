@@ -157,6 +157,12 @@ pub mod ffi {
         /// `get_input_dims` with appropriate batch dimension. Likewise, the output dimension will
         /// be of shape `get_output_dims` with batch dimension equal to input batch dimension.
         fn infer(self: Pin<&mut Engine>, input: &Vec<InputTensor>) -> Result<Vec<OutputTensor>>;
+
+        fn infer_zerocopy(
+            self: Pin<&mut Engine>,
+            input: &Vec<InputTensor>,
+            output: &mut Vec<OutputTensor>,
+        ) -> Result<()>;
     }
 }
 
