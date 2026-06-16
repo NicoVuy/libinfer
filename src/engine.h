@@ -78,6 +78,9 @@ public:
   rust::Vec<OutputTensor> infer(const rust::Vec<InputTensor> &input);
   void infer_zerocopy(const rust::Vec<InputTensor> &input, rust::Vec<OutputTensor> &output);
 
+  // Returns true if this is a unified memory architecture (UMA) NVIDIA system.
+  bool is_uma() const;
+
   // Get dimensions for all input tensors
   rust::Vec<TensorInfo> get_input_dims() const;
 

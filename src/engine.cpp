@@ -642,3 +642,17 @@ rust::Vec<TensorInfo> Engine::get_output_dims() const {
   }
   return result;
 }
+
+bool Engine::is_uma() const {
+  int device = 0;
+  cudaError_t err = cudaGetDevice(&device);
+  if (err != cudaSuccess) {
+    return false;
+  }
+  int pageableMemoryAccess = 0;
+  err = cudaDeviceGetAttribute(&pageableMemoryAccess, cudaDevAttrPageableMemoryAccess, device);
+  if (err != cudaSuccess) {
+    return false;
+  }
+  return pageableMemoryAccess != 0;
+}

@@ -163,6 +163,8 @@ pub mod ffi {
             input: &Vec<InputTensor>,
             output: &mut Vec<OutputTensor>,
         ) -> Result<()>;
+
+        fn is_uma(self: &Engine) -> bool;
     }
 }
 
